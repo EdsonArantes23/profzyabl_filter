@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+data/
