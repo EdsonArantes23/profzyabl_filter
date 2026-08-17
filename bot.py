@@ -470,6 +470,35 @@ async def ensure_admin_cb(cb: CallbackQuery) -> bool:
     return True
 
 
+def _parse_command_ids(tokens: List[str]) -> List[int]:
+    user_ids: List[int] = []
+
+    for token in tokens:
+        for part in token.replace(",", " ").replace(";", " ").split():
+            if not part:
+                continue
+
+            try:
+                user_ids.append(int(part))
+            except ValueError:
+                raise ValueError(part)
+
+    return list(dict.fromkeys(user_ids))
+
+
+def _resolve_whitelist_code(code: str) -> Optional[str]:
+    code = code.strip().lower()
+
+    if code == "all":
+        return "all"
+
+    for known_code in CODE_TO_TYPE.keys():
+        if known_code.strip().lower() == code:
+            return known_code
+
+    return None
+
+
 # ---------------------------------------------------------------
 # Клавиатуры и рендеринг меню
 # ---------------------------------------------------------------
@@ -597,14 +626,17 @@ async def render_help(message: Message, edit: bool = False):
         "🚫 Удалять у всех\n\n"
         "Если выбран режим «Только выбранные пользователи», "
         "то нужно добавить разрешённые user_id.\n\n"
-        "Ввести ID можно кнопкой «✍️ Ввести ID» или командой:\n"
-        "<code>/setid topic_id type_code user_id allow|delete</code>\n\n"
-        "Пример:\n"
-        "<code>/setid 12 p 123456 allow</code>\n\n"
+        "Команды для белого списка:\n"
+        "<code>/whitelist topic_id all id1,id2,id3</code>\n"
+        "<code>/whitelist topic_id id1,id2,id3</code>\n\n"
+        "Удаление ID:\n"
+        "<code>/removeid topic_id all id1,id2,id3</code>\n"
+        "<code>/removeid topic_id id1,id2,id3</code>\n\n"
+        "Полный сброс ветки:\n"
+        "<code>/resettopic topic_id</code>\n\n"
         "Если тема не отображается в списке, отправь в нужную ветку группы команду:\n"
         "<code>/addtopic Название ветки</code>\n\n"
-        "Темы без настроек не трогаются.\n\n"
-        "Кнопка «Сбросить ветку» полностью убирает настройки ветки."
+        "Темы без настроек не трогаются."
     )
 
     markup = back_main_markup()
@@ -1032,6 +1064,191 @@ async def cmd_set_user_id(message: Message):
     )
 
 
+@router.message(Command("whitelist"), F.chat.type == ChatType.PRIVATE)
+async def cmd_whitelist(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_owner(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    usage = (
+        "Использование:\n"
+        "<code>/whitelist topic_id all id1,id2,id3</code>\n\n"
+        "Или можно не указывать all, тогда белый список применится ко всем типам:\n"
+        "<code>/whitelist topic_id id1,id2,id3</code>\n\n"
+        "Пример:\n"
+        "<code>/whitelist 210299 all 123456789,987654321</code>\n\n"
+        "Также можно отправлять ID столбцом:\n"
+        "<code>/whitelist 210299 all\n"
+        "123456789\n"
+        "987654321</code>"
+    )
+
+    tokens = (message.text or "").replace(",", " ").replace(";", " ").split()
+
+    if len(tokens) < 3:
+        await message.answer(usage)
+        return
+
+    try:
+        topic_id = int(tokens[1])
+    except ValueError:
+        await message.answer("topic_id должен быть числом.")
+        return
+
+    resolved_code = _resolve_whitelist_code(tokens[2])
+
+    if resolved_code is not None:
+        code = resolved_code
+        id_tokens = tokens[3:]
+    else:
+        code = "all"
+        id_tokens = tokens[2:]
+
+    try:
+        user_ids = _parse_command_ids(id_tokens)
+    except ValueError as e:
+        await message.answer(f"Не удалось распознать ID: {e.args[0]}")
+        return
+
+    if not user_ids:
+        await message.answer("Список ID пустой.")
+        return
+
+    await ensure_topic_exists(GROUP_ID, topic_id)
+
+    if code == "all":
+        ctypes = CONTENT_TYPES_ORDER
+        type_name = "все типы"
+    else:
+        ctype = CODE_TO_TYPE[code]
+        ctypes = [ctype]
+        type_name = CONTENT_TYPES[ctype]["name"]
+
+    for ctype in ctypes:
+        await set_mode(GROUP_ID, topic_id, ctype, "selected")
+
+        for user_id in user_ids:
+            await set_user_rule(GROUP_ID, topic_id, ctype, user_id, "allow")
+
+    answer_lines = [
+        "✅ Белый список добавлен.",
+        f"Ветка: <code>{topic_id}</code>",
+        f"Тип: <b>{html_escape(type_name)}</b>",
+        f"Пользователей добавлено: <code>{len(user_ids)}</code>",
+        "",
+        "Режим установлен: 👥 Только выбранные пользователи.",
+    ]
+
+    await message.answer("\n".join(answer_lines))
+
+
+@router.message(Command("removeid"), F.chat.type == ChatType.PRIVATE)
+async def cmd_remove_id(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_owner(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    usage = (
+        "Использование:\n"
+        "<code>/removeid topic_id all id1,id2,id3</code>\n\n"
+        "Или без all, тогда удалит из всех типов:\n"
+        "<code>/removeid topic_id id1,id2,id3</code>\n\n"
+        "Пример:\n"
+        "<code>/removeid 210299 all 123456789</code>"
+    )
+
+    tokens = (message.text or "").replace(",", " ").replace(";", " ").split()
+
+    if len(tokens) < 3:
+        await message.answer(usage)
+        return
+
+    try:
+        topic_id = int(tokens[1])
+    except ValueError:
+        await message.answer("topic_id должен быть числом.")
+        return
+
+    resolved_code = _resolve_whitelist_code(tokens[2])
+
+    if resolved_code is not None:
+        code = resolved_code
+        id_tokens = tokens[3:]
+    else:
+        code = "all"
+        id_tokens = tokens[2:]
+
+    try:
+        user_ids = _parse_command_ids(id_tokens)
+    except ValueError as e:
+        await message.answer(f"Не удалось распознать ID: {e.args[0]}")
+        return
+
+    if not user_ids:
+        await message.answer("Список ID пустой.")
+        return
+
+    await ensure_topic_exists(GROUP_ID, topic_id)
+
+    if code == "all":
+        ctypes = CONTENT_TYPES_ORDER
+        type_name = "все типы"
+    else:
+        ctype = CODE_TO_TYPE[code]
+        ctypes = [ctype]
+        type_name = CONTENT_TYPES[ctype]["name"]
+
+    for ctype in ctypes:
+        for user_id in user_ids:
+            await delete_user_rule(GROUP_ID, topic_id, ctype, user_id)
+
+    answer_lines = [
+        "🗑 ID удалены из списка.",
+        f"Ветка: <code>{topic_id}</code>",
+        f"Тип: <b>{html_escape(type_name)}</b>",
+        f"Удалено пользователей: <code>{len(user_ids)}</code>",
+    ]
+
+    await message.answer("\n".join(answer_lines))
+
+
+@router.message(Command("resettopic"), F.chat.type == ChatType.PRIVATE)
+async def cmd_reset_topic(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_owner(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+
+    usage = "Использование:\n<code>/resettopic topic_id</code>"
+
+    args = (message.text or "").split()
+
+    if len(args) != 2:
+        await message.answer(usage)
+        return
+
+    try:
+        topic_id = int(args[1])
+    except ValueError:
+        await message.answer("topic_id должен быть числом.")
+        return
+
+    await reset_topic(GROUP_ID, topic_id)
+
+    await message.answer(
+        f"✅ Ветка <code>{topic_id}</code> полностью сброшена.\n"
+        "Правила типов и пользовательские списки удалены."
+    )
+
+
 # ---------------------------------------------------------------
 # Обработка ввода user_id через кнопку
 # ---------------------------------------------------------------
@@ -1234,6 +1451,7 @@ async def cb_type_settings(cb: CallbackQuery):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 3:
         await cb.answer()
         return
@@ -1261,6 +1479,7 @@ async def cb_set_mode(cb: CallbackQuery):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 4:
         await cb.answer()
         return
@@ -1308,6 +1527,7 @@ async def cb_user_list(cb: CallbackQuery):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 3:
         await cb.answer()
         return
@@ -1335,6 +1555,7 @@ async def cb_add_user_start(cb: CallbackQuery, state: FSMContext):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 3:
         await cb.answer()
         return
@@ -1375,6 +1596,7 @@ async def cb_add_user_rule(cb: CallbackQuery):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 5:
         await cb.answer()
         return
@@ -1407,6 +1629,7 @@ async def cb_delete_user_rule(cb: CallbackQuery):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 4:
         await cb.answer()
         return
@@ -1436,6 +1659,7 @@ async def cb_toggle_user_rule(cb: CallbackQuery):
         return
 
     parts = cb.data.split(":")
+
     if len(parts) != 4:
         await cb.answer()
         return
